@@ -4,6 +4,7 @@ import logging
 import tempfile
 import uuid
 
+import httpx
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -45,6 +46,31 @@ def extract_url(text: str) -> str | None:
     return None
 
 
+async def download_via_tikwm(url: str, out_dir: str) -> str | None:
+    """Резервный способ для TikTok: сторонний сервис tikwm.com,
+    который сам обходит блокировки на своей стороне."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://www.tikwm.com/api/",
+                data={"url": url},
+            )
+            data = resp.json()
+            video_url = data.get("data", {}).get("play")
+            if not video_url:
+                return None
+
+            filepath = os.path.join(out_dir, f"{uuid.uuid4()}.mp4")
+            async with client.stream("GET", video_url) as video_resp:
+                with open(filepath, "wb") as f:
+                    async for chunk in video_resp.aiter_bytes():
+                        f.write(chunk)
+            return filepath
+    except Exception as e:
+        logger.error(f"Ошибка резервного скачивания через tikwm: {e}")
+        return None
+
+
 async def download_video(url: str, out_dir: str) -> str | None:
     """Скачивает видео по ссылке через yt-dlp, возвращает путь к файлу или None."""
     out_template = os.path.join(out_dir, f"{uuid.uuid4()}.%(ext)s")
@@ -58,6 +84,25 @@ async def download_video(url: str, out_dir: str) -> str | None:
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
     }
 
+    # Куки из браузера — помогают обойти блокировку IP для TikTok.
+    # Укажи путь к файлу cookies.txt (формат Netscape), экспортированному
+    # расширением вроде "Get cookies.txt LOCALLY".
+    cookies_file = os.environ.get("COOKIES_FILE")
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
+
+    # Прокси — альтернатива/дополнение к кукам, если хостинг бота
+    # находится на IP датацентра, заблокированном TikTok.
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        ydl_opts["proxy"] = proxy_url
+
+    # Переключение между внутренними API TikTok (web / mobile app API).
+    # Иногда один способ заблокирован, а другой ещё работает.
+    tiktok_api = os.environ.get("TIKTOK_API_HINT")  # "api" или "webpage"
+    if tiktok_api:
+        ydl_opts["extractor_args"] = {"tiktok": {"api_hostname": [tiktok_api]}}
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -66,6 +111,12 @@ async def download_video(url: str, out_dir: str) -> str | None:
                 return filepath
     except Exception as e:
         logger.error(f"Ошибка скачивания {url}: {e}")
+
+    # Если это TikTok и основной способ не сработал — пробуем резервный.
+    if "tiktok" in url.lower():
+        logger.info("Пробую резервный способ скачивания через tikwm.com")
+        return await download_via_tikwm(url, out_dir)
+
     return None
 
 
