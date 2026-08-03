@@ -1,81 +1,132 @@
 import os
 import re
-import telebot
-import requests
-import traceback
+import logging
+import tempfile
+import uuid
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-bot = telebot.TeleBot(BOT_TOKEN)
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-# Регулярное выражение для поиска TikTok, Instagram Reels и YouTube Shorts
+import yt_dlp
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН")
+
+# Ограничение на размер файла, который бот может отправить (Telegram Bot API: 50 МБ)
+MAX_FILE_SIZE_MB = 50
+
 URL_PATTERN = re.compile(
-    r'(https?://\S*(?:tiktok\.com|instagram\.com/reel|youtube\.com/shorts)\S*)', 
-    re.IGNORECASE
+    r"(https?://)?"
+    r"(www\.)?"
+    r"("
+    r"(vm|vt|www)\.tiktok\.com|tiktok\.com|"
+    r"(www\.)?instagram\.com/reel[s]?|"
+    r"(www\.)?youtube\.com/shorts|"
+    r"youtu\.be"
+    r")"
+    r"[^\s]*",
+    re.IGNORECASE,
 )
 
-print("=== БОТ ЗАПУЩЕН И ГОТОВ ВЫВОДИТЬ ПОДРОБНЫЕ ЛОГИ ===")
 
-@bot.message_handler(func=lambda message: message.text and URL_PATTERN.search(message.text))
-def handle_all_videos(message):
-    match = URL_PATTERN.search(message.text)
-    url = match.group(1)
-    
-    print(f"\n[LOG]: Обнаружена ссылка в чате {message.chat.id}: {url}")
-    
-    # Включаем статус отправки видео в чате
-    bot.send_chat_action(message.chat.id, 'upload_video')
-    print("[LOG]: Отправлен статус 'upload_video' в Telegram...")
-    
+def extract_url(text: str) -> str | None:
+    match = URL_PATTERN.search(text)
+    if match:
+        url = match.group(0)
+        if not url.startswith("http"):
+            url = "https://" + url
+        return url
+    return None
+
+
+async def download_video(url: str, out_dir: str) -> str | None:
+    """Скачивает видео по ссылке через yt-dlp, возвращает путь к файлу или None."""
+    out_template = os.path.join(out_dir, f"{uuid.uuid4()}.%(ext)s")
+
+    ydl_opts = {
+        "outtmpl": out_template,
+        "format": "mp4/best[ext=mp4]/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
+    }
+
     try:
-        # Запрос к первому API
-        api_url = f"https://v02.ru{url}" 
-        print(f"[LOG]: Отправляю запрос к первому API: {api_url}")
-        
-        response = requests.get(api_url, timeout=12).json()
-        print(f"[LOG]: Ответ от первого API: {response}")
-        
-        if response.get("status") == "success" and "video_url" in response:
-            video_url = response["video_url"]
-            title = response.get("title", "Video")
-            print(f"[LOG]: Прямая ссылка на MP4 получена: {video_url}")
-            print(f"[LOG]: Пытаюсь отправить видео в Telegram...")
-            
-            # Отправка в Telegram
-            bot.send_video(
-                chat_id=message.chat.id, 
-                video=video_url, 
-                reply_to_message_id=message.message_id,
-                caption=f"🎬 {title[:50]}..." if title else None
-            )
-            print("[LOG]: !!! ВИДЕО УСПЕШНО ОТПРАВЛЕНО В ЧАТ !!!")
-            
-        else:
-            print("[LOG]: Первое API не выдало ссылку. Пробую резервное API...")
-            fallback_url = f"https://lewisandclark.tech{url}"
-            print(f"[LOG]: Отправляю запрос к резервному API: {fallback_url}")
-            
-            fallback_resp = requests.get(fallback_url, timeout=12).json()
-            print(f"[LOG]: Ответ от резервного API: {fallback_resp}")
-            
-            if fallback_resp.get("success") and "url" in fallback_resp:
-                video_url = fallback_resp["url"]
-                print(f"[LOG]: Резервная ссылка на MP4 получена: {video_url}")
-                print(f"[LOG]: Пытаюсь отправить видео в Telegram...")
-                
-                bot.send_video(
-                    chat_id=message.chat.id, 
-                    video=video_url, 
-                    reply_to_message_id=message.message_id
-                )
-                print("[LOG]: !!! ВИДЕО УСПЕШНО ОТПРАВЛЕНО ЧЕРЕЗ РЕЗЕРВНЫЙ ПУТЬ !!!")
-            else:
-                print(f"[LOG]: ОБА АПИ ОТКАЗАЛИСЬ ОБРАБАТЫВАТЬ ССЫЛКУ: {url}")
-                
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            if os.path.exists(filepath):
+                return filepath
     except Exception as e:
-        print(f"[ERROR]: Произошла критическая ошибка в коде бота!")
-        print(f"[ERROR]: Описание ошибки: {e}")
-        print("[ERROR]: Полный след ошибки (traceback):")
-        print(traceback.format_exc())
+        logger.error(f"Ошибка скачивания {url}: {e}")
+    return None
 
-if __name__ == '__main__':
-    bot.infinity_polling()
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    url = extract_url(message.text)
+    if not url:
+        return
+
+    chat_id = update.effective_chat.id
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        filepath = await download_video(url, tmp_dir)
+
+        if not filepath:
+            await message.reply_text(
+                "Не получилось скачать видео 😕 "
+                "Либо оно слишком большое (>50 МБ), либо ссылка недоступна."
+            )
+            return
+
+        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            await message.reply_text(
+                f"Видео весит {file_size_mb:.1f} МБ — это больше лимита в "
+                f"{MAX_FILE_SIZE_MB} МБ, которое разрешено обычным ботам Telegram."
+            )
+            return
+
+        try:
+            with open(filepath, "rb") as video_file:
+                await message.reply_video(
+                    video=video_file,
+                    supports_streaming=True,
+                )
+        except Exception as e:
+            logger.error(f"Ошибка отправки видео: {e}")
+            await message.reply_text("Скачал, но не смог отправить видео в чат.")
+
+
+def main() -> None:
+    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН":
+        raise RuntimeError(
+            "Не задан токен бота. Установи переменную окружения BOT_TOKEN "
+            "или впиши токен прямо в bot.py."
+        )
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+
+    logger.info("Бот запущен")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
