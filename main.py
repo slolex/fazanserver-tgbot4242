@@ -5,6 +5,7 @@ import tempfile
 import uuid
 
 import httpx
+import imageio_ffmpeg
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -82,6 +83,10 @@ async def download_video(url: str, out_dir: str) -> str | None:
         "quiet": True,
         "no_warnings": True,
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
+        # Путь к статическому ffmpeg-бинарнику из imageio-ffmpeg.
+        # Работает без прав администратора и без apt/системных пакетов —
+        # важно для хостингов вроде bothost.ru, где нет shell-доступа.
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
     }
 
     # Куки из браузера — помогают обойти блокировку IP для TikTok.
