@@ -78,7 +78,12 @@ async def download_video(url: str, out_dir: str) -> str | None:
 
     ydl_opts = {
         "outtmpl": out_template,
-        "format": "mp4/best[ext=mp4]/best",
+        # Явно берём лучшее видео и лучшее аудио отдельно и склеиваем
+        # через ffmpeg в mp4 — раньше строка "mp4/best[ext=mp4]/best"
+        # просто хватала уже готовый (более сжатый) файл, из-за чего
+        # терялось качество.
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -157,11 +162,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         try:
+            send_as_document = os.environ.get("SEND_AS_DOCUMENT", "false").lower() == "true"
             with open(filepath, "rb") as video_file:
-                await message.reply_video(
-                    video=video_file,
-                    supports_streaming=True,
-                )
+                if send_as_document:
+                    # Документом Telegram не пережимает файл вообще —
+                    # качество будет максимально близко к скачанному,
+                    # но пропадает встроенный видеоплеер в чате.
+                    await message.reply_document(document=video_file)
+                else:
+                    await message.reply_video(
+                        video=video_file,
+                        supports_streaming=True,
+                    )
         except Exception as e:
             logger.error(f"Ошибка отправки видео: {e}")
             await message.reply_text("Скачал, но не смог отправить видео в чат.")
