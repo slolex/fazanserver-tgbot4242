@@ -75,18 +75,25 @@ def start_command(message):
 @bot.message_handler(func=lambda message: message.text == "⬇️ Скачать лаунчер")
 def send_launcher(message):
     tg_id = message.chat.id
-    # Ссылка с dl=1 для прямого скачивания
     direct_link = "https://www.dropbox.com/scl/fi/v62ngxh27wp7lcaz514qv/FazanLauncher.exe?rlkey=1bqd6ht7lejp9vip1dyq0io3x&st=8s0y3quf&dl=1"
     
-    bot.send_message(tg_id, "⏳ Загружаю лаунчер, подождите пару секунд...")
+    bot.send_message(tg_id, "⏳ Загружаю лаунчер (12 МБ), это займет несколько секунд...")
     
     try:
-        bot.send_document(tg_id, direct_link, caption="🎮 Ваш лаунчер Fazan Server!")
-    except Exception:
+        # 1. Бот скачивает файл с Dropbox в свою память
+        response = requests.get(direct_link)
+        
+        # 2. Бот отправляет скачанный файл в Telegram, передав имя файла и байты
+        bot.send_document(
+            tg_id, 
+            document=('FazanLauncher.exe', response.content), 
+            caption="🎮 Ваш лаунчер Fazan Server!"
+        )
+    except Exception as e:
         bot.send_message(
             tg_id, 
-            f"❌ Файл оказался слишком большим для прямой отправки через Telegram.\n\n"
-            f"📥 Скачайте лаунчер по этой ссылке:\n{direct_link.replace('dl=1', 'dl=0')}"
+            f"❌ Ошибка при отправке файла.\n\n"
+            f"📥 Скачайте лаунчер вручную по ссылке:\n{direct_link.replace('dl=1', 'dl=0')}"
         )
 
 @bot.message_handler(func=lambda message: message.text == "📝 Добавиться в белый список")
