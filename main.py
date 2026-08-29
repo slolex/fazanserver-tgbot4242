@@ -4,7 +4,7 @@ from telebot import types
 import sqlite3
 
 # --- НАСТРОЙКИ ---
-BOT_TOKEN = os.environ.get('BOT_TOKEN') # Токен берется из настроек хостинга
+BOT_TOKEN = os.environ.get('BOT_TOKEN') # Токен берется из переменных окружения хостинга
 ADMIN_IDS = [1659141886, 1243314006, 7023363751]
 MAX_ACCOUNTS = 2 
 
@@ -53,7 +53,8 @@ def get_available_admins():
 # --- КЛАВИАТУРЫ ---
 def get_main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("📝 Добавиться в белый список"), types.KeyboardButton("💬 Поддержка"))
+    markup.add(types.KeyboardButton("📝 Добавиться в белый список"))
+    markup.add(types.KeyboardButton("💬 Поддержка"), types.KeyboardButton("⬇️ Скачать лаунчер"))
     return markup
 
 def get_cancel_menu(text="❌ Завершить диалог"):
@@ -70,6 +71,23 @@ def start_command(message):
         "Привет! Добро пожаловать в бота Fazan Server. Выберите действие:", 
         reply_markup=get_main_menu()
     )
+
+@bot.message_handler(func=lambda message: message.text == "⬇️ Скачать лаунчер")
+def send_launcher(message):
+    tg_id = message.chat.id
+    # Ссылка с dl=1 для прямого скачивания
+    direct_link = "https://www.dropbox.com/scl/fi/v62ngxh27wp7lcaz514qv/FazanLauncher.exe?rlkey=1bqd6ht7lejp9vip1dyq0io3x&st=8s0y3quf&dl=1"
+    
+    bot.send_message(tg_id, "⏳ Загружаю лаунчер, подождите пару секунд...")
+    
+    try:
+        bot.send_document(tg_id, direct_link, caption="🎮 Ваш лаунчер Fazan Server!")
+    except Exception:
+        bot.send_message(
+            tg_id, 
+            f"❌ Файл оказался слишком большим для прямой отправки через Telegram.\n\n"
+            f"📥 Скачайте лаунчер по этой ссылке:\n{direct_link.replace('dl=1', 'dl=0')}"
+        )
 
 @bot.message_handler(func=lambda message: message.text == "📝 Добавиться в белый список")
 def whitelist_request(message):
@@ -94,7 +112,7 @@ def end_support_user(message):
     tg_id = message.chat.id
     user_states[tg_id] = None
     
-    # Если игрок общался с админом, отключаем админа
+    # Отключаем админа, если он общался с этим игроком
     admin_to_free = None
     for a_id, u_id in active_chats.items():
         if u_id == tg_id:
@@ -123,7 +141,7 @@ def handle_text(message):
     tg_id = message.chat.id
     state = user_states.get(tg_id)
     
-    # 1. Если пишет АДМИН, который находится в режиме чата
+    # 1. Если пишет АДМИН в режиме чата
     if tg_id in active_chats:
         target_user = active_chats[tg_id]
         try:
@@ -148,7 +166,6 @@ def handle_text(message):
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("✅ Добавить", callback_data=f"wl_{request_id}"))
 
-        # Отправляем ТОЛЬКО свободным админам (которые не в чате)
         for admin in get_available_admins():
             try:
                 msg = bot.send_message(admin, f"🚨 **Новая заявка!**\nНикнейм: `{nickname}`", parse_mode="Markdown", reply_markup=markup)
@@ -161,7 +178,6 @@ def handle_text(message):
 
     # 3. Режим поддержки (игрок пишет)
     if state == 'support_mode':
-        # Проверяем, общается ли уже игрок с конкретным админом
         current_admin = None
         for a_id, u_id in active_chats.items():
             if u_id == tg_id:
@@ -169,10 +185,8 @@ def handle_text(message):
                 break
                 
         if current_admin:
-            # Отправляем сообщение напрямую подключенному админу
             bot.send_message(current_admin, f"👤 {message.text}")
         else:
-            # Игрок только написал вопрос, рассылаем свободным админам кнопку "Начать чат"
             username = f"@{message.from_user.username}" if message.from_user.username else "Без юзернейма"
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("💬 Начать чат", callback_data=f"chat_{tg_id}"))
@@ -190,7 +204,7 @@ def handle_text(message):
 def handle_callbacks(call):
     admin_id = call.message.chat.id
     
-    # Логика принятия тикета (Начать чат)
+    # Кнопка "Начать чат"
     if call.data.startswith('chat_'):
         user_id = int(call.data.split('_')[1])
         
@@ -213,7 +227,7 @@ def handle_callbacks(call):
         try: bot.send_message(user_id, "👨‍💻 Администратор подключился к диалогу!")
         except: pass
 
-    # Логика добавления в Whitelist (осталась прежней)
+    # Кнопка "Добавить в Whitelist"
     elif call.data.startswith('wl_'):
         request_id = int(call.data.split('_')[1])
         
