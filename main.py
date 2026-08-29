@@ -1,213 +1,221 @@
 import os
-import re
-import logging
-import tempfile
-import uuid
+import telebot
+from telebot import types
+import sqlite3
 
-import httpx
-import imageio_ffmpeg
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = os.environ.get('BOT_TOKEN') # Теперь токен берется из настроек хостинга
+ADMIN_IDS = [1659141886, 1243314006, 7023363751]
+MAX_ACCOUNTS = 2
+bot = telebot.TeleBot(BOT_TOKEN)
 
-import yt_dlp
+# --- БАЗА ДАННЫХ ---
+def init_db():
+    conn = sqlite3.connect('fazan_server.db')
+    c = conn.cursor()
+    # Таблица лимитов пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (tg_id INTEGER PRIMARY KEY, whitelist_count INTEGER DEFAULT 0)''')
+    # Таблица самих заявок
+    c.execute('''CREATE TABLE IF NOT EXISTS wl_requests 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, nickname TEXT, tg_user_id INTEGER, status TEXT DEFAULT 'pending')''')
+    # Таблица для хранения сообщений админов (чтобы менять их у всех сразу)
+    c.execute('''CREATE TABLE IF NOT EXISTS admin_msgs 
+                 (request_id INTEGER, admin_id INTEGER, message_id INTEGER)''')
+    conn.commit()
+    conn.close()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+def get_whitelist_count(tg_id):
+    conn = sqlite3.connect('fazan_server.db')
+    c = conn.cursor()
+    c.execute("SELECT whitelist_count FROM users WHERE tg_id = ?", (tg_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else 0
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН")
+def increment_whitelist_count(tg_id):
+    conn = sqlite3.connect('fazan_server.db')
+    c = conn.cursor()
+    count = get_whitelist_count(tg_id)
+    if count == 0:
+        c.execute("INSERT INTO users (tg_id, whitelist_count) VALUES (?, 1)", (tg_id,))
+    else:
+        c.execute("UPDATE users SET whitelist_count = whitelist_count + 1 WHERE tg_id = ?", (tg_id,))
+    conn.commit()
+    conn.close()
 
-# Ограничение на размер файла, который бот может отправить (Telegram Bot API: 50 МБ)
-MAX_FILE_SIZE_MB = 50
+# --- СЛОВАРИ СОСТОЯНИЙ ---
+user_states = {} 
 
-URL_PATTERN = re.compile(
-    r"(https?://)?"
-    r"(www\.)?"
-    r"("
-    r"(vm|vt|www)\.tiktok\.com|tiktok\.com|"
-    r"(www\.)?instagram\.com/reel[s]?|"
-    r"(www\.)?youtube\.com/shorts|"
-    r"youtu\.be"
-    r")"
-    r"[^\s]*",
-    re.IGNORECASE,
-)
+# --- КЛАВИАТУРА МЕНЮ ---
+def get_main_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    btn1 = types.KeyboardButton("📝 Добавиться в белый список")
+    btn2 = types.KeyboardButton("💬 Поддержка")
+    markup.add(btn1, btn2)
+    return markup
 
-
-def extract_url(text: str) -> str | None:
-    match = URL_PATTERN.search(text)
-    if match:
-        url = match.group(0)
-        if not url.startswith("http"):
-            url = "https://" + url
-        return url
-    return None
-
-
-async def download_via_tikwm(url: str, out_dir: str) -> str | None:
-    """Основной способ для TikTok: сторонний сервис tikwm.com.
-
-    ВАЖНО: без параметра hd=1 API tikwm часто вообще не отдаёт поле
-    hdplay, и раньше бот брал "play" — это SD-версия без вотермарки,
-    заметно хуже по битрейту. С hd=1 приходит hdplay — HD без
-    вотермарки, это и есть то же качество, что видно в приложении TikTok.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://www.tikwm.com/api/",
-                data={"url": url, "hd": 1},
-            )
-            data = resp.json().get("data", {})
-
-            # Порядок приоритета: HD без вотермарки -> обычное без вотермарки
-            video_url = data.get("hdplay") or data.get("play")
-            if not video_url:
-                return None
-
-            filepath = os.path.join(out_dir, f"{uuid.uuid4()}.mp4")
-            async with client.stream("GET", video_url) as video_resp:
-                with open(filepath, "wb") as f:
-                    async for chunk in video_resp.aiter_bytes():
-                        f.write(chunk)
-            return filepath
-    except Exception as e:
-        logger.error(f"Ошибка скачивания через tikwm: {e}")
-        return None
-
-
-async def download_via_ytdlp(url: str, out_dir: str) -> str | None:
-    """Скачивает видео по ссылке через yt-dlp, возвращает путь к файлу или None.
-
-    Используется как основной способ для YouTube Shorts и Instagram Reels,
-    и как резервный для TikTok (если tikwm недоступен).
-    """
-    out_template = os.path.join(out_dir, f"{uuid.uuid4()}.%(ext)s")
-
-    ydl_opts = {
-        "outtmpl": out_template,
-        # bestvideo+bestaudio реально имеет смысл для YouTube (там видео
-        # и аудио отдаются отдельными адаптивными потоками). TikTok и
-        # Instagram обычно отдают уже готовый смешанный файл, так что
-        # для них эта строка просто fallback'ится на "best".
-        "format": "bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
-        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-    }
-
-    # Куки из браузера критично важны для Instagram — без них Instagram
-    # часто отдаёт урезанное качество "для гостя". Экспортируй cookies.txt
-    # (формат Netscape) из залогиненного в Instagram браузера.
-    cookies_file = os.environ.get("COOKIES_FILE")
-    if cookies_file and os.path.exists(cookies_file):
-        ydl_opts["cookiefile"] = cookies_file
-
-    proxy_url = os.environ.get("PROXY_URL")
-    if proxy_url:
-        ydl_opts["proxy"] = proxy_url
-
-    tiktok_api = os.environ.get("TIKTOK_API_HINT")  # "api" или "webpage"
-    if tiktok_api:
-        ydl_opts["extractor_args"] = {"tiktok": {"api_hostname": [tiktok_api]}}
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if os.path.exists(filepath):
-                return filepath
-    except Exception as e:
-        logger.error(f"Ошибка скачивания через yt-dlp {url}: {e}")
-
-    return None
-
-
-async def download_video(url: str, out_dir: str) -> str | None:
-    """Выбирает способ скачивания в зависимости от площадки."""
-
-    if "tiktok" in url.lower():
-        # Для TikTok tikwm с hd=1 обычно даёт лучше результат и быстрее,
-        # чем yt-dlp (у которого TikTok-экстрактор нестабилен и часто
-        # получает урезанную версию). yt-dlp — запасной вариант.
-        filepath = await download_via_tikwm(url, out_dir)
-        if filepath:
-            return filepath
-        logger.info("tikwm не сработал, пробую yt-dlp для TikTok")
-        return await download_via_ytdlp(url, out_dir)
-
-    # YouTube Shorts и Instagram Reels — через yt-dlp
-    return await download_via_ytdlp(url, out_dir)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
-        return
-
-    url = extract_url(message.text)
-    if not url:
-        return
-
-    chat_id = update.effective_chat.id
-
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        filepath = await download_video(url, tmp_dir)
-
-        if not filepath:
-            await message.reply_text(
-                "Не получилось скачать видео 😕 "
-                "Либо оно слишком большое (>50 МБ), либо ссылка недоступна."
-            )
-            return
-
-        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        if file_size_mb > MAX_FILE_SIZE_MB:
-            await message.reply_text(
-                f"Видео весит {file_size_mb:.1f} МБ — это больше лимита в "
-                f"{MAX_FILE_SIZE_MB} МБ, которое разрешено обычным ботам Telegram."
-            )
-            return
-
-        try:
-            send_as_document = os.environ.get("SEND_AS_DOCUMENT", "false").lower() == "true"
-            with open(filepath, "rb") as video_file:
-                if send_as_document:
-                    await message.reply_document(document=video_file)
-                else:
-                    await message.reply_video(
-                        video=video_file,
-                        supports_streaming=True,
-                    )
-        except Exception as e:
-            logger.error(f"Ошибка отправки видео: {e}")
-            await message.reply_text("Скачал, но не смог отправить видео в чат.")
-
-
-def main() -> None:
-    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН":
-        raise RuntimeError(
-            "Не задан токен бота. Установи переменную окружения BOT_TOKEN "
-            "или впиши токен прямо в bot.py."
-        )
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+# --- ЛОГИКА БОТА ---
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    user_states[message.chat.id] = None
+    bot.send_message(
+        message.chat.id, 
+        "Привет! Добро пожаловать в бота Fazan Server. Выберите действие:", 
+        reply_markup=get_main_menu()
     )
 
-    logger.info("Бот запущен")
-    app.run_polling()
+@bot.message_handler(func=lambda message: message.text == "📝 Добавиться в белый список")
+def whitelist_request(message):
+    tg_id = message.chat.id
+    count = get_whitelist_count(tg_id)
+    
+    if count >= MAX_ACCOUNTS:
+        bot.send_message(tg_id, f"❌ Вы уже добавили максимальное количество аккаунтов ({MAX_ACCOUNTS}).")
+        return
+    
+    user_states[tg_id] = 'waiting_for_nick'
+    bot.send_message(tg_id, "Введите ваш никнейм в Minecraft (отмена - /start):", reply_markup=types.ReplyKeyboardRemove())
 
+@bot.message_handler(func=lambda message: message.text == "💬 Поддержка")
+def support_request(message):
+    tg_id = message.chat.id
+    user_states[tg_id] = 'support_mode'
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("❌ Завершить диалог"))
+    
+    bot.send_message(tg_id, "Режим поддержки включен. Опишите вашу проблему, и администратор ответит вам здесь.", reply_markup=markup)
 
-if __name__ == "__main__":
-    main()
+@bot.message_handler(func=lambda message: message.text == "❌ Завершить диалог")
+def end_support(message):
+    user_states[message.chat.id] = None
+    bot.send_message(message.chat.id, "Диалог завершен.", reply_markup=get_main_menu())
+
+# Обработка текста
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    tg_id = message.chat.id
+    state = user_states.get(tg_id)
+    
+    # 1. Ответ админа в поддержке
+    if tg_id in ADMIN_IDS and message.reply_to_message:
+        reply_text = message.reply_to_message.text
+        if reply_text and "ID:" in reply_text:
+            try:
+                user_id_str = reply_text.split("ID: ")[1].split("\n")[0]
+                target_user_id = int(user_id_str)
+                bot.send_message(target_user_id, f"👨‍💻 **Ответ администратора:**\n{message.text}", parse_mode="Markdown")
+                bot.reply_to(message, "Ответ отправлен игроку.")
+            except Exception:
+                bot.reply_to(message, "Ошибка при отправке.")
+        return
+
+    # 2. Ввод никнейма для белого списка
+    if state == 'waiting_for_nick':
+        nickname = message.text.strip()
+        increment_whitelist_count(tg_id)
+        user_states[tg_id] = None
+        
+        bot.send_message(tg_id, f"✅ Никнейм `{nickname}` отправлен на проверку администраторам!", parse_mode="Markdown", reply_markup=get_main_menu())
+        
+        # Записываем заявку в БД, чтобы получить её ID
+        conn = sqlite3.connect('fazan_server.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO wl_requests (nickname, tg_user_id) VALUES (?, ?)", (nickname, tg_id))
+        request_id = c.lastrowid
+        conn.commit()
+
+        # Создаем инлайн-кнопку
+        markup = types.InlineKeyboardMarkup()
+        btn = types.InlineKeyboardButton("✅ Добавить", callback_data=f"wl_approve_{request_id}")
+        markup.add(btn)
+
+        # Отправляем админам и сохраняем ID сообщений
+        for admin in ADMIN_IDS:
+            try:
+                username = f"@{message.from_user.username}" if message.from_user.username else f"ID: {tg_id}"
+                msg = bot.send_message(admin, f"🚨 **Новая заявка в Whitelist!**\nНикнейм: `{nickname}`\nОт: {username}", parse_mode="Markdown", reply_markup=markup)
+                c.execute("INSERT INTO admin_msgs (request_id, admin_id, message_id) VALUES (?, ?, ?)", (request_id, admin, msg.message_id))
+            except:
+                pass
+        
+        conn.commit()
+        conn.close()
+        return
+
+    # 3. Режим поддержки
+    if state == 'support_mode':
+        for admin in ADMIN_IDS:
+            try:
+                username = f"@{message.from_user.username}" if message.from_user.username else "Без юзернейма"
+                support_msg = f"📩 **Запрос в поддержку**\nID: {tg_id}\nОт: {username}\n\nТекст: {message.text}"
+                bot.send_message(admin, support_msg)
+            except:
+                pass
+        return
+
+    bot.send_message(tg_id, "Пожалуйста, используйте кнопки меню.", reply_markup=get_main_menu())
+
+# --- ОБРАБОТКА НАЖАТИЯ КНОПОК АДМИНАМИ ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('wl_approve_'))
+def handle_whitelist_approval(call):
+    request_id = int(call.data.split('_')[2])
+    
+    conn = sqlite3.connect('fazan_server.db')
+    c = conn.cursor()
+    
+    # Проверяем статус заявки
+    c.execute("SELECT status, nickname, tg_user_id FROM wl_requests WHERE id = ?", (request_id,))
+    request_data = c.fetchone()
+    
+    if not request_data:
+        bot.answer_callback_query(call.id, "Заявка не найдена.")
+        conn.close()
+        return
+        
+    status, nickname, tg_user_id = request_data
+    
+    if status == 'approved':
+        bot.answer_callback_query(call.id, "Эта заявка уже обработана другим администратором!", show_alert=True)
+        conn.close()
+        return
+        
+    # Помечаем заявку как обработанную
+    c.execute("UPDATE wl_requests SET status = 'approved' WHERE id = ?", (request_id,))
+    
+    # Получаем все сообщения админов с этой заявкой
+    c.execute("SELECT admin_id, message_id FROM admin_msgs WHERE request_id = ?", (request_id,))
+    admin_messages = c.fetchall()
+    
+    conn.commit()
+    conn.close()
+    
+    admin_name = f"@{call.from_user.username}" if call.from_user.username else call.from_user.first_name
+    
+    # Редактируем сообщение У ВСЕХ админов
+    for admin_id, message_id in admin_messages:
+        try:
+            bot.edit_message_text(
+                chat_id=admin_id,
+                message_id=message_id,
+                text=f"✅ **Заявка обработана!**\nНикнейм: `{nickname}`\nДобавил: {admin_name}",
+                parse_mode="Markdown",
+                reply_markup=None # Убирает инлайн-кнопку
+            )
+        except Exception:
+            pass # Если админ удалил сообщение, просто игнорируем ошибку
+            
+    # Уведомляем игрока, что его приняли
+    try:
+        bot.send_message(tg_user_id, f"🎉 Ваш никнейм `{nickname}` успешно добавлен в белый список администратором!")
+    except:
+        pass
+
+    # Уведомление для того админа, который нажал кнопку (появляется сверху экрана)
+    bot.answer_callback_query(call.id, f"Никнейм {nickname} добавлен! Все админы оповещены.")
+
+if __name__ == '__main__':
+    init_db()
+    print("Бот Fazan Server запущен...")
+    bot.infinity_polling()
