@@ -326,4 +326,13 @@ def handle_callbacks(call):
 if __name__ == '__main__':
     init_db()
     print("Бот Fazan Server запущен...")
-    bot.infinity_polling()
+    # infinity_polling иногда всё же пробрасывает исключение наружу (например,
+    # обрыв соединения при долгом опросе Telegram) и процесс падает целиком.
+    # Оборачиваем в свой цикл: если бот упал — логируем и перезапускаем через паузу,
+    # вместо того чтобы весь бот молча умирал.
+    while True:
+        try:
+            bot.infinity_polling(timeout=25, long_polling_timeout=25)
+        except Exception as e:
+            print(f"Бот упал с ошибкой: {e}\nПерезапуск через 5 секунд...")
+            time.sleep(5)
