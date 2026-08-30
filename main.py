@@ -1,4 +1,6 @@
 import os
+import time
+import functools
 import requests
 import telebot
 from telebot import types
@@ -10,6 +12,52 @@ ADMIN_IDS = [1659141886, 1243314006, 7023363751]
 MAX_ACCOUNTS = 2 
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# --- АНТИ-СПАМ (защита от долбёжки по кнопкам) ---
+# Для каждой "тяжёлой" кнопки — свой кулдаун и своё хранилище времени последнего нажатия.
+# Админы (ADMIN_IDS) из-под кулдауна исключены, чтобы не мешать их работе.
+
+def antiflood(cooldown_seconds, warn_text="⏳ Слишком часто. Попробуйте ещё раз через {sec} сек."):
+    """Декоратор: не даёт одному и тому же пользователю дёргать хендлер чаще,
+    чем раз в cooldown_seconds. Хранит время последнего вызова в памяти процесса."""
+    last_call = {}
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(message, *args, **kwargs):
+            tg_id = message.chat.id
+            if tg_id in ADMIN_IDS:
+                return func(message, *args, **kwargs)
+
+            now = time.time()
+            elapsed = now - last_call.get(tg_id, 0)
+            if elapsed < cooldown_seconds:
+                wait = int(cooldown_seconds - elapsed) + 1
+                try:
+                    bot.send_message(tg_id, warn_text.format(sec=wait))
+                except Exception:
+                    pass
+                return
+            last_call[tg_id] = now
+            return func(message, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def is_flooding(tg_id, storage, cooldown_seconds):
+    """Ручная проверка кулдауна (для случаев внутри одного хендлера,
+    где throttle нужен только на одну ветку логики, а не на весь хендлер)."""
+    if tg_id in ADMIN_IDS:
+        return False
+    now = time.time()
+    elapsed = now - storage.get(tg_id, 0)
+    if elapsed < cooldown_seconds:
+        return True
+    storage[tg_id] = now
+    return False
+
+
+_support_broadcast_times = {}  # антиспам для новых обращений в поддержку
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -74,6 +122,7 @@ def start_command(message):
     )
 
 @bot.message_handler(func=lambda message: message.text == "⬇️ Скачать лаунчер")
+@antiflood(45, "⏳ Лаунчер уже отправлялся недавно. Подождите {sec} сек. и попробуйте снова.")
 def send_launcher(message):
     tg_id = message.chat.id
     direct_link = "https://www.dropbox.com/scl/fi/v62ngxh27wp7lcaz514qv/FazanLauncher.exe?rlkey=1bqd6ht7lejp9vip1dyq0io3x&st=8s0y3quf&dl=1"
@@ -98,6 +147,7 @@ def send_launcher(message):
         )
 
 @bot.message_handler(func=lambda message: message.text == "📝 Добавиться в белый список")
+@antiflood(5)
 def whitelist_request(message):
     tg_id = message.chat.id
     
@@ -195,6 +245,12 @@ def handle_text(message):
         if current_admin:
             bot.send_message(current_admin, f"👤 {message.text}")
         else:
+            # Пока админ не подключился, каждое сообщение рассылается ВСЕМ доступным
+            # админам — это самое место, где спамом можно закидать сразу всех.
+            if is_flooding(tg_id, _support_broadcast_times, 10):
+                bot.send_message(tg_id, "⏳ Не так быстро — администраторы уже видят ваше обращение, дождитесь ответа.")
+                return
+
             username = f"@{message.from_user.username}" if message.from_user.username else "Без юзернейма"
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("💬 Начать чат", callback_data=f"chat_{tg_id}"))
